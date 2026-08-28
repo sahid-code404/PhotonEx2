@@ -1,0 +1,7 @@
+.gradle/
+.idea/
+local.properties
+**/build/
+*.iml
+.DS_Store
+/tools/dev-signing/photonex2-dev.jks

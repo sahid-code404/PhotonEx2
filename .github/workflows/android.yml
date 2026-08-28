@@ -1,0 +1,137 @@
+name: Android CI and Development OTA
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: photonex2-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 35
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Resolve development version
+        shell: bash
+        run: |
+          echo "PHOTONEX2_VERSION_CODE=$((100000 + GITHUB_RUN_NUMBER))" >> "$GITHUB_ENV"
+          echo "PHOTONEX2_VERSION_NAME=0.1.${GITHUB_RUN_NUMBER}-dev" >> "$GITHUB_ENV"
+
+      - name: Restore permanent development signer
+        run: bash scripts/prepare-dev-signing.sh
+
+      - name: Unit tests and APK
+        run: gradle --no-daemon --stacktrace testDevOtaUnitTest assembleDevOta
+
+      - name: Verify and package OTA artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          src="app/build/outputs/apk/devOta/app-devOta.apk"
+          test -f "$src"
+          cp "$src" dist/PhotonEx2-dev.apk
+
+          expected="$(tr -d '[:space:]:' < tools/dev-signing/EXPECTED_CERT_SHA256 | tr '[:upper:]' '[:lower:]')"
+          actual="$($ANDROID_HOME/build-tools/35.0.0/apksigner verify --print-certs dist/PhotonEx2-dev.apk \
+            | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -n1 | tr -d ':[:space:]' | tr '[:upper:]' '[:lower:]')"
+          test -n "$actual"
+          test "$actual" = "$expected"
+
+          $ANDROID_HOME/build-tools/35.0.0/aapt dump badging dist/PhotonEx2-dev.apk \
+            | grep -F "package: name='com.sahidcode404.photonex2'" >/dev/null
+
+          sha="$(sha256sum dist/PhotonEx2-dev.apk | awk '{print $1}')"
+          size="$(stat -c '%s' dist/PhotonEx2-dev.apk)"
+          jq -n \
+            --arg channel development \
+            --arg applicationId com.sahidcode404.photonex2 \
+            --arg versionName "$PHOTONEX2_VERSION_NAME" \
+            --arg gitSha "$GITHUB_SHA" \
+            --arg assetName PhotonEx2-dev.apk \
+            --arg sha256 "$sha" \
+            --arg signingCertSha256 "$expected" \
+            --arg builtAtUtc "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --argjson versionCode "$PHOTONEX2_VERSION_CODE" \
+            --argjson sizeBytes "$size" \
+            '{schema:1,channel:$channel,applicationId:$applicationId,versionCode:$versionCode,versionName:$versionName,minSdk:23,gitSha:$gitSha,assetName:$assetName,sha256:$sha256,sizeBytes:$sizeBytes,signingCertSha256:$signingCertSha256,builtAtUtc:$builtAtUtc}' \
+            > dist/dev-manifest.json
+          (cd dist && sha256sum PhotonEx2-dev.apk dev-manifest.json > SHA256SUMS.txt)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PhotonEx2-dev-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-development-ota:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    concurrency:
+      group: photonex2-dev-ota
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: PhotonEx2-dev-${{ github.sha }}
+          path: dist
+
+      - name: Re-verify exact build artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum --check SHA256SUMS.txt)
+          test "$(jq -r .gitSha dist/dev-manifest.json)" = "$GITHUB_SHA"
+          test "$(jq -r .applicationId dist/dev-manifest.json)" = "com.sahidcode404.photonex2"
+
+      - name: Publish rolling development release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view dev-latest >/dev/null 2>&1; then
+            gh release upload dev-latest dist/PhotonEx2-dev.apk dist/dev-manifest.json --clobber
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/dev-latest" \
+              -f sha="$GITHUB_SHA" -F force=true >/dev/null
+            gh release edit dev-latest --title "PhotonEx2 Development OTA" \
+              --notes "Verified development build for ${GITHUB_SHA}" --prerelease
+          else
+            gh release create dev-latest dist/PhotonEx2-dev.apk dist/dev-manifest.json \
+              --target "$GITHUB_SHA" --title "PhotonEx2 Development OTA" \
+              --notes "Verified development build for ${GITHUB_SHA}" --prerelease
+          fi
