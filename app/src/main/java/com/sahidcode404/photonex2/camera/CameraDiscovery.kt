@@ -14,9 +14,11 @@ import kotlin.math.ln
 /**
  * Two-phase Camera2 discovery modeled after the CamX startup/topology split.
  *
- * Startup only inspects the public Java camera list and the minimum metadata needed to choose one
- * credible RAW route quickly. Complete AUX discovery is deliberately deferred until after the first
- * preview frame and reconciles Java public IDs, logical-camera physical members, and Camera-NDK IDs.
+ * Startup first attempts the last route that actually produced a preview frame on this exact Android
+ * build. On a cold/changed install it inspects only the public Java camera list and minimum metadata
+ * needed to choose one credible RAW route. Complete AUX discovery is deliberately deferred until
+ * after the first preview frame and reconciles Java public IDs, logical-camera physical members, and
+ * Camera-NDK IDs.
  *
  * Physical members remain expressed as (logical open ID + physical target ID). A physical member is
  * not discarded just because its standalone characteristics omit a RAW/private stream inventory:
@@ -25,8 +27,21 @@ import kotlin.math.ln
  */
 class CameraDiscovery(private val cameraManager: CameraManager) {
 
-    /** Fast first-frame seed. No physical-camera walk and no native discovery occurs here. */
+    /** Fast first-frame seed. No physical-camera walk or native discovery occurs here. */
     fun discoverStartupRawRoute(): LensRoute? {
+        CameraStartupCache.route()?.let { cached ->
+            val parent = runCatching {
+                cameraManager.getCameraCharacteristics(cached.openCameraId)
+            }.getOrNull()
+            if (parent != null) {
+                val physicalStillBelongs = cached.physicalCameraId == null ||
+                    (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P &&
+                        parent.physicalCameraIds.contains(cached.physicalCameraId))
+                if (physicalStillBelongs) return cached
+            }
+            CameraStartupCache.clear()
+        }
+
         val ids = runCatching { cameraManager.cameraIdList.toList() }.getOrDefault(emptyList())
             .distinct()
             .take(MAX_PUBLIC_IDS)
