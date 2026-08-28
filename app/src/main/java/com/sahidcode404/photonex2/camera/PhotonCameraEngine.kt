@@ -3,7 +3,6 @@ package com.sahidcode404.photonex2.camera
 import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Matrix
-import android.graphics.RectF
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
@@ -25,6 +24,7 @@ import androidx.annotation.RequiresApi
 import java.io.File
 import java.util.concurrent.Executor
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.roundToInt
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -37,10 +37,11 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
- * Single owner of Camera2 device/session resources for PhotonEx2.
+ * Single owner of PhotonEx2 Camera2 device/session resources.
  *
- * Preview is the only non-RAW stream. Still capture adds one RAW_SENSOR ImageReader. No JPEG, YUV,
- * HEIF, DEPTH or vendor encoded still surface is ever configured by this class.
+ * Startup is intentionally two-phase: a minimal public-ID seed route reaches visible preview first;
+ * complete Java/physical/Camera-NDK AUX discovery starts only after that preview is alive. Still
+ * capture configures only RAW_SENSOR in addition to the private preview stream.
  */
 class PhotonCameraEngine(
     private val context: Context,
@@ -62,6 +63,9 @@ class PhotonCameraEngine(
 
     @Volatile private var started = false
     @Volatile private var generation = 0L
+    @Volatile private var completeDiscoveryStarted = false
+    @Volatile private var completeDiscoveryFinished = false
+
     private var textureView: TextureView? = null
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
@@ -69,21 +73,27 @@ class PhotonCameraEngine(
     private var rawReader: ImageReader? = null
     private var activeRoute: LensRoute? = null
     private var activeCharacteristics: CameraCharacteristics? = null
-    @Volatile private var latestPreviewResult: TotalCaptureResult? = null
+    @Volatile private var latestPreviewResult: CaptureResult? = null
     @Volatile private var burstCollector: BurstCollector? = null
 
     fun start() {
         if (started) return
         started = true
         scope.launch {
-            val routes = withContext(Dispatchers.Default) { discovery.discoverRawRoutes() }
-            if (routes.isEmpty()) {
+            val seed = withContext(Dispatchers.Default) { discovery.discoverStartupRawRoute() }
+            if (!started) return@launch
+            if (seed == null) {
                 _state.update { it.copy(error = "No app-accessible RAW camera was found") }
+                // A complete pass can still recover vendor/NDK routes that the seed path could not use.
+                launchCompleteDiscoveryOnce(recoverIfNeeded = true)
                 return@launch
             }
-            val selected = routes.firstOrNull { it.facing == LensFacing.BACK } ?: routes.first()
             _state.update {
-                it.copy(lenses = routes, selectedLensKey = selected.key, error = null)
+                it.copy(
+                    lenses = listOf(seed),
+                    selectedLensKey = seed.key,
+                    error = null,
+                )
             }
             openSelectedWhenReady()
         }
@@ -91,7 +101,7 @@ class PhotonCameraEngine(
 
     fun pauseCamera() {
         if (!started) return
-        generation += 1
+        generation += 1L
         closeCameraResources()
     }
 
@@ -111,7 +121,7 @@ class PhotonCameraEngine(
             }
 
             override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
-                generation += 1
+                generation += 1L
                 closeCameraResources()
                 return true
             }
@@ -124,7 +134,7 @@ class PhotonCameraEngine(
     fun detachPreview(view: TextureView) {
         if (textureView === view) {
             textureView = null
-            generation += 1
+            generation += 1L
             closeCameraResources()
         }
     }
@@ -133,7 +143,7 @@ class PhotonCameraEngine(
         val target = _state.value.lenses.firstOrNull { it.key == key } ?: return
         if (target.key == _state.value.selectedLensKey || _state.value.capturing) return
         _state.update { it.copy(selectedLensKey = key, previewReady = false, error = null) }
-        generation += 1
+        generation += 1L
         closeCameraResources()
         openSelectedWhenReady()
     }
@@ -156,7 +166,7 @@ class PhotonCameraEngine(
         val session = captureSession ?: return
         val reader = rawReader ?: return
         val device = cameraDevice ?: return
-        val characteristics = activeCharacteristics ?: return
+        val dngCharacteristics = activeCharacteristics ?: return
         val view = textureView ?: return
         val frameCount = ExposurePlanner.chooseFrameCount(
             manualOverride = lensPreferences.getManualFrameCount(route.key),
@@ -173,16 +183,22 @@ class PhotonCameraEngine(
                     directory.deleteRecursively()
                     return@complete
                 }
+                // Restore a live view immediately after sensor acquisition. Merge/save stays off-camera.
+                cameraHandler.post {
+                    if (localGeneration == generation) resumePreview()
+                }
                 processBurst(
-                    frames,
-                    characteristics,
-                    route,
-                    view.display?.rotation ?: Surface.ROTATION_0,
-                    directory,
+                    frames = frames,
+                    characteristics = dngCharacteristics,
+                    route = route,
+                    displayRotation = view.display?.rotation ?: Surface.ROTATION_0,
+                    directory = directory,
+                    localGeneration = localGeneration,
                 )
             },
             onFailure = { message ->
                 directory.deleteRecursively()
+                cameraHandler.post { resumePreview() }
                 _state.update { it.copy(capturing = false, progressText = null, error = message) }
             },
         )
@@ -215,21 +231,20 @@ class PhotonCameraEngine(
         }, rawHandler)
 
         val requests = runCatching {
-            List(frameCount) {
-                device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
-                    addTarget(reader.surface)
-                    set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
-                    set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-                    set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
-                    set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
-                }.build()
-            }
+            buildBurstRequests(
+                device = device,
+                reader = reader,
+                route = route,
+                frameCount = frameCount,
+            )
         }.getOrElse {
-            collector.fail("Unable to build RAW burst: ${it.message}")
+            collector.fail("Unable to build RAW burst: ${it.message ?: it.javaClass.simpleName}")
             return
         }
 
         runCatching {
+            // Do not interleave preview requests with a locked computational RAW burst.
+            session.stopRepeating()
             session.captureBurst(
                 requests,
                 object : CameraCaptureSession.CaptureCallback() {
@@ -259,11 +274,140 @@ class PhotonCameraEngine(
             collector.fail("RAW burst could not start: ${it.message ?: it.javaClass.simpleName}")
         }
 
+        val timeout = (BASE_BURST_TIMEOUT_MS + frameCount * 700L).coerceAtMost(MAX_BURST_TIMEOUT_MS)
         cameraHandler.postDelayed({
             if (burstCollector === collector && !collector.isFinished()) {
                 collector.fail("RAW burst timed out")
             }
-        }, BURST_TIMEOUT_MS)
+        }, timeout)
+    }
+
+    private fun buildBurstRequests(
+        device: CameraDevice,
+        reader: ImageReader,
+        route: LensRoute,
+        frameCount: Int,
+    ): List<CaptureRequest> {
+        val controls = cameraManager.getCameraCharacteristics(route.openCameraId)
+        val preview = latestPreviewResult
+        val exposurePlan = manualExposurePlan(controls, preview)
+        val focusDistance = preview?.get(CaptureResult.LENS_FOCUS_DISTANCE)
+            ?.takeIf { it.isFinite() && it >= 0f }
+        return List(frameCount) {
+            device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                addTarget(reader.surface)
+                set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+                applyStabilization(this, controls)
+                applyLockedFocus(this, controls, focusDistance)
+                applyLockedAwb(this, controls)
+                if (exposurePlan != null) {
+                    set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
+                    set(CaptureRequest.SENSOR_EXPOSURE_TIME, exposurePlan.exposureTimeNs)
+                    set(CaptureRequest.SENSOR_SENSITIVITY, exposurePlan.sensitivityIso)
+                } else {
+                    val aeModes = controls.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_MODES) ?: intArrayOf()
+                    if (aeModes.contains(CaptureRequest.CONTROL_AE_MODE_ON)) {
+                        set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                    }
+                    if (controls.get(CameraCharacteristics.CONTROL_AE_LOCK_AVAILABLE) == true) {
+                        set(CaptureRequest.CONTROL_AE_LOCK, true)
+                    }
+                }
+            }.build()
+        }
+    }
+
+    /** Converts a long auto exposure into a faster handheld exposure by trading shutter time for ISO. */
+    private fun manualExposurePlan(
+        characteristics: CameraCharacteristics,
+        preview: CaptureResult?,
+    ): ExposureLock? {
+        val capabilities = characteristics.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+            ?: return null
+        if (!capabilities.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR)) return null
+        val aeModes = characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_MODES) ?: return null
+        if (!aeModes.contains(CaptureRequest.CONTROL_AE_MODE_OFF)) return null
+
+        val previewExposure = preview?.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.takeIf { it > 0L }
+            ?: return null
+        val previewIso = preview.get(CaptureResult.SENSOR_SENSITIVITY)?.takeIf { it > 0 }
+            ?: return null
+        val exposureRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+            ?: return null
+        val sensitivityRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+            ?: return null
+
+        val cappedExposure = previewExposure
+            .coerceAtMost(HANDHELD_MAX_EXPOSURE_NS)
+            .coerceIn(exposureRange.lower, exposureRange.upper)
+        val targetSignal = previewExposure.toDouble() * previewIso.toDouble()
+        val desiredIso = (targetSignal / cappedExposure.toDouble())
+            .coerceIn(sensitivityRange.lower.toDouble(), sensitivityRange.upper.toDouble())
+            .roundToInt()
+        return ExposureLock(
+            exposureTimeNs = cappedExposure,
+            sensitivityIso = desiredIso,
+        )
+    }
+
+    private fun applyLockedFocus(
+        builder: CaptureRequest.Builder,
+        characteristics: CameraCharacteristics,
+        previewFocusDistance: Float?,
+    ) {
+        val modes = characteristics.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES) ?: intArrayOf()
+        val minimumFocusDistance = characteristics.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE)
+            ?.takeIf { it.isFinite() && it > 0f }
+        if (previewFocusDistance != null && minimumFocusDistance != null &&
+            modes.contains(CaptureRequest.CONTROL_AF_MODE_OFF)
+        ) {
+            builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
+            builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, previewFocusDistance.coerceIn(0f, minimumFocusDistance))
+            return
+        }
+        when {
+            modes.contains(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE) ->
+                builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+            modes.contains(CaptureRequest.CONTROL_AF_MODE_AUTO) ->
+                builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
+            modes.contains(CaptureRequest.CONTROL_AF_MODE_OFF) ->
+                builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
+        }
+    }
+
+    private fun applyLockedAwb(
+        builder: CaptureRequest.Builder,
+        characteristics: CameraCharacteristics,
+    ) {
+        val modes = characteristics.get(CameraCharacteristics.CONTROL_AWB_AVAILABLE_MODES) ?: intArrayOf()
+        if (modes.contains(CaptureRequest.CONTROL_AWB_MODE_AUTO)) {
+            builder.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
+        }
+        if (characteristics.get(CameraCharacteristics.CONTROL_AWB_LOCK_AVAILABLE) == true) {
+            builder.set(CaptureRequest.CONTROL_AWB_LOCK, true)
+        }
+    }
+
+    private fun applyStabilization(
+        builder: CaptureRequest.Builder,
+        characteristics: CameraCharacteristics,
+    ) {
+        val optical = characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
+            ?: intArrayOf()
+        if (optical.contains(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON)) {
+            builder.set(
+                CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON,
+            )
+        }
+        val video = characteristics.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)
+            ?: intArrayOf()
+        if (video.contains(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF)) {
+            builder.set(
+                CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF,
+            )
+        }
     }
 
     private fun processBurst(
@@ -272,12 +416,15 @@ class PhotonCameraEngine(
         route: LensRoute,
         displayRotation: Int,
         directory: File,
+        localGeneration: Long,
     ) {
         scope.launch {
             try {
                 val outcome = withContext(Dispatchers.IO) {
                     RawBurstMerger.merge(frames, characteristics, directory) { text ->
-                        _state.update { it.copy(progressText = text) }
+                        _state.update { state ->
+                            if (state.capturing) state.copy(progressText = text) else state
+                        }
                     }
                 }
                 val uri = withContext(Dispatchers.IO) {
@@ -310,7 +457,9 @@ class PhotonCameraEngine(
             } finally {
                 burstCollector = null
                 runCatching { directory.deleteRecursively() }
-                if (started) resumePreview()
+                if (started && localGeneration == generation && !_state.value.previewReady) {
+                    resumePreview()
+                }
             }
         }
     }
@@ -348,25 +497,20 @@ class PhotonCameraEngine(
                     override fun onDisconnected(camera: CameraDevice) {
                         camera.close()
                         if (cameraDevice === camera) cameraDevice = null
-                        _state.update { it.copy(previewReady = false, error = "Camera disconnected") }
+                        onRouteFailure(route, "Camera disconnected")
                     }
 
                     override fun onError(camera: CameraDevice, error: Int) {
                         camera.close()
                         if (cameraDevice === camera) cameraDevice = null
-                        _state.update { it.copy(previewReady = false, error = "Camera error $error") }
+                        onRouteFailure(route, "Camera error $error")
                     }
                 },
                 cameraHandler,
             )
         } catch (t: Throwable) {
             Log.e(TAG, "Open failed", t)
-            _state.update {
-                it.copy(
-                    previewReady = false,
-                    error = "Unable to open this RAW lens: ${t.message ?: t.javaClass.simpleName}",
-                )
-            }
+            onRouteFailure(route, "Unable to open this RAW lens: ${t.message ?: t.javaClass.simpleName}")
         }
     }
 
@@ -400,9 +544,7 @@ class PhotonCameraEngine(
 
             override fun onConfigureFailed(session: CameraCaptureSession) {
                 session.close()
-                _state.update {
-                    it.copy(previewReady = false, error = "This RAW lens rejected the preview + RAW session")
-                }
+                onRouteFailure(route, "This RAW lens rejected the preview + RAW session")
             }
         }
 
@@ -415,12 +557,10 @@ class PhotonCameraEngine(
             }
         } catch (t: Throwable) {
             Log.e(TAG, "Session creation failed", t)
-            _state.update {
-                it.copy(
-                    previewReady = false,
-                    error = "This RAW lens rejected the preview + RAW session: ${t.message ?: t.javaClass.simpleName}",
-                )
-            }
+            onRouteFailure(
+                route,
+                "This RAW lens rejected the preview + RAW session: ${t.message ?: t.javaClass.simpleName}",
+            )
         }
     }
 
@@ -452,12 +592,28 @@ class PhotonCameraEngine(
         route: LensRoute,
     ) {
         try {
+            val controls = cameraManager.getCameraCharacteristics(route.openCameraId)
             val request = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                 addTarget(preview)
                 set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
-                set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-                set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
-                set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
+                val aeModes = controls.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_MODES) ?: intArrayOf()
+                if (aeModes.contains(CaptureRequest.CONTROL_AE_MODE_ON)) {
+                    set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                }
+                val afModes = controls.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES) ?: intArrayOf()
+                when {
+                    afModes.contains(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE) ->
+                        set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                    afModes.contains(CaptureRequest.CONTROL_AF_MODE_AUTO) ->
+                        set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
+                    afModes.contains(CaptureRequest.CONTROL_AF_MODE_OFF) ->
+                        set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
+                }
+                val awbModes = controls.get(CameraCharacteristics.CONTROL_AWB_AVAILABLE_MODES) ?: intArrayOf()
+                if (awbModes.contains(CaptureRequest.CONTROL_AWB_MODE_AUTO)) {
+                    set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
+                }
+                applyStabilization(this, controls)
             }.build()
             session.setRepeatingRequest(
                 request,
@@ -467,9 +623,10 @@ class PhotonCameraEngine(
                         request: CaptureRequest,
                         result: TotalCaptureResult,
                     ) {
-                        latestPreviewResult = result
+                        latestPreviewResult = physicalResultOrTotal(result, route)
                         if (!_state.value.previewReady) {
                             _state.update { it.copy(previewReady = true, error = null) }
+                            launchCompleteDiscoveryOnce(recoverIfNeeded = false)
                         }
                     }
                 },
@@ -477,7 +634,75 @@ class PhotonCameraEngine(
             )
             textureView?.let { configureTransform(it, route) }
         } catch (t: Throwable) {
-            _state.update { it.copy(previewReady = false, error = "Preview failed: ${t.message}") }
+            onRouteFailure(route, "Preview failed: ${t.message ?: t.javaClass.simpleName}")
+        }
+    }
+
+    private fun launchCompleteDiscoveryOnce(recoverIfNeeded: Boolean) {
+        synchronized(this) {
+            if (completeDiscoveryStarted) return
+            completeDiscoveryStarted = true
+        }
+        scope.launch {
+            val routes = withContext(Dispatchers.Default) { discovery.discoverRawRoutes() }
+            completeDiscoveryFinished = true
+            if (!started || routes.isEmpty()) {
+                if (recoverIfNeeded && routes.isEmpty()) {
+                    _state.update { it.copy(error = "No usable RAW camera route survived complete discovery") }
+                }
+                return@launch
+            }
+
+            val previousSelected = _state.value.selectedLensKey
+            val previousActive = activeRoute?.key
+            val selected = routes.firstOrNull { it.key == previousSelected }
+                ?: routes.firstOrNull { it.key == previousActive }
+                ?: routes.firstOrNull { it.facing == LensFacing.BACK && !it.isPhysicalRoute }
+                ?: routes.firstOrNull { it.facing == LensFacing.BACK }
+                ?: routes.first()
+            _state.update {
+                it.copy(
+                    lenses = routes,
+                    selectedLensKey = selected.key,
+                    error = if (recoverIfNeeded) null else it.error,
+                )
+            }
+
+            if (activeRoute?.key != selected.key && cameraDevice == null && captureSession == null) {
+                openSelectedWhenReady()
+            }
+        }
+    }
+
+    private fun onRouteFailure(route: LensRoute, message: String) {
+        Log.w(TAG, "Route ${route.key} failed: $message")
+        val current = _state.value
+        val remaining = if (completeDiscoveryFinished || current.lenses.size > 1) {
+            current.lenses.filterNot { it.key == route.key }
+        } else {
+            current.lenses
+        }
+        val fallback = remaining.firstOrNull { it.facing == LensFacing.BACK && !it.isPhysicalRoute }
+            ?: remaining.firstOrNull { it.facing == LensFacing.BACK }
+            ?: remaining.firstOrNull()
+        _state.update {
+            it.copy(
+                lenses = remaining,
+                selectedLensKey = fallback?.key ?: it.selectedLensKey,
+                previewReady = false,
+                error = message,
+            )
+        }
+
+        if (!completeDiscoveryStarted) {
+            launchCompleteDiscoveryOnce(recoverIfNeeded = true)
+            return
+        }
+        if (fallback != null && fallback.key != route.key) {
+            generation += 1L
+            closeCameraResources()
+            _state.update { it.copy(selectedLensKey = fallback.key, error = message) }
+            openSelectedWhenReady()
         }
     }
 
@@ -490,8 +715,12 @@ class PhotonCameraEngine(
     }
 
     private fun characteristicsFor(route: LensRoute): CameraCharacteristics {
-        val id = route.physicalCameraId ?: route.openCameraId
-        return cameraManager.getCameraCharacteristics(id)
+        if (route.physicalCameraId != null) {
+            runCatching { cameraManager.getCameraCharacteristics(route.physicalCameraId) }
+                .getOrNull()
+                ?.let { return it }
+        }
+        return cameraManager.getCameraCharacteristics(route.openCameraId)
     }
 
     private fun physicalResultOrTotal(result: TotalCaptureResult, route: LensRoute): CaptureResult {
@@ -501,37 +730,58 @@ class PhotonCameraEngine(
         return result
     }
 
+    /**
+     * TextureView defaults to independently scaling buffer X/Y into the view. setPolyToPoly replaces
+     * that with the reference's sensor-aware rotation + one uniform center-crop scale, so aspect ratio
+     * can never stretch. Front mirroring is applied in final display coordinates.
+     */
     private fun configureTransform(view: TextureView, route: LensRoute) {
-        val width = view.width
-        val height = view.height
-        if (width <= 0 || height <= 0) return
-        val rotation = view.display?.rotation ?: Surface.ROTATION_0
-        val matrix = Matrix()
-        val viewRect = RectF(0f, 0f, width.toFloat(), height.toFloat())
-        val buffer = route.previewSize
-        val swapped = rotation == Surface.ROTATION_90 || rotation == Surface.ROTATION_270
-        val bufferRect = if (swapped) {
-            RectF(0f, 0f, buffer.height.toFloat(), buffer.width.toFloat())
-        } else {
-            RectF(0f, 0f, buffer.width.toFloat(), buffer.height.toFloat())
-        }
-        val centerX = viewRect.centerX()
-        val centerY = viewRect.centerY()
-        bufferRect.offset(centerX - bufferRect.centerX(), centerY - bufferRect.centerY())
-        matrix.setRectToRect(viewRect, bufferRect, Matrix.ScaleToFit.FILL)
-        val scale = maxOf(
-            height.toFloat() / bufferRect.height(),
-            width.toFloat() / bufferRect.width(),
+        val viewWidth = view.width
+        val viewHeight = view.height
+        if (viewWidth <= 0 || viewHeight <= 0) return
+        val displayDegrees = rotationToDegrees(view.display?.rotation ?: Surface.ROTATION_0)
+        val geometry = PreviewGeometryPolicy.resolve(
+            viewWidth = viewWidth,
+            viewHeight = viewHeight,
+            streamWidth = route.previewSize.width,
+            streamHeight = route.previewSize.height,
+            sensorOrientationDegrees = route.sensorOrientationDegrees,
+            displayRotationDegrees = displayDegrees,
+            lensFacing = route.facing,
+            mirrorFrontPreview = true,
         )
-        matrix.postScale(scale, scale, centerX, centerY)
-        val displayDegrees = rotationToDegrees(rotation)
-        val rotationDegrees = if (route.facing == LensFacing.FRONT) {
-            (route.sensorOrientationDegrees + displayDegrees) % 360
-        } else {
-            (route.sensorOrientationDegrees - displayDegrees + 360) % 360
+        val source = floatArrayOf(
+            0f, 0f,
+            viewWidth.toFloat(), 0f,
+            0f, viewHeight.toFloat(),
+        )
+        val p0 = PreviewGeometryPolicy.mapBufferPoint(
+            0f, 0f,
+            route.previewSize.width, route.previewSize.height,
+            viewWidth, viewHeight,
+            geometry,
+        )
+        val p1 = PreviewGeometryPolicy.mapBufferPoint(
+            route.previewSize.width.toFloat(), 0f,
+            route.previewSize.width, route.previewSize.height,
+            viewWidth, viewHeight,
+            geometry,
+        )
+        val p2 = PreviewGeometryPolicy.mapBufferPoint(
+            0f, route.previewSize.height.toFloat(),
+            route.previewSize.width, route.previewSize.height,
+            viewWidth, viewHeight,
+            geometry,
+        )
+        val destination = floatArrayOf(
+            p0.first, p0.second,
+            p1.first, p1.second,
+            p2.first, p2.second,
+        )
+        val matrix = Matrix()
+        check(matrix.setPolyToPoly(source, 0, destination, 0, 3)) {
+            "Unable to resolve preview transform"
         }
-        matrix.postRotate(rotationDegrees.toFloat(), centerX, centerY)
-        if (route.facing == LensFacing.FRONT) matrix.postScale(-1f, 1f, centerX, centerY)
         view.setTransform(matrix)
     }
 
@@ -572,7 +822,7 @@ class PhotonCameraEngine(
 
     override fun close() {
         started = false
-        generation += 1
+        generation += 1L
         closeCameraResources()
         cameraThread.quitSafely()
         rawThread.quitSafely()
@@ -649,9 +899,16 @@ class PhotonCameraEngine(
         }
     }
 
+    private data class ExposureLock(
+        val exposureTimeNs: Long,
+        val sensitivityIso: Int,
+    )
+
     private companion object {
         const val TAG = "PhotonCameraEngine"
         const val RAW_READER_MAX_IMAGES = 4
-        const val BURST_TIMEOUT_MS = 12_000L
+        const val HANDHELD_MAX_EXPOSURE_NS = 33_333_333L
+        const val BASE_BURST_TIMEOUT_MS = 5_000L
+        const val MAX_BURST_TIMEOUT_MS = 14_000L
     }
 }

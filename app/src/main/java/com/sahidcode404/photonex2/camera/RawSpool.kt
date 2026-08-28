@@ -39,35 +39,56 @@ object RawSpool {
         val proxyHeight = (height + step - 1) / step
         val proxy = IntArray(proxyWidth * proxyHeight)
         val source = plane.buffer.duplicate().order(ByteOrder.nativeOrder())
-        val compactRow = ByteArray(width * 2)
+        val baseOffset = source.position()
+        val requiredEnd = baseOffset.toLong() + (height - 1L) * rowStride + width.toLong() * pixelStride
+        require(requiredEnd <= source.limit().toLong()) { "RAW plane buffer is smaller than its strides" }
 
-        BufferedOutputStream(FileOutputStream(file), 1024 * 1024).use { out ->
-            for (y in 0 until height) {
-                val rowStart = y * rowStride
-                if (pixelStride == 2) {
-                    val row = source.duplicate()
-                    row.position(rowStart)
-                    row.limit(rowStart + width * 2)
-                    row.get(compactRow, 0, width * 2)
-                } else {
-                    for (x in 0 until width) {
+        // Most RAW_SENSOR buffers are already tightly packed RAW16. Copy that memory in large channel
+        // writes instead of issuing one Java stream write per sensor row. Proxy samples are collected
+        // with absolute reads so the Camera Image can still be closed as soon as this function returns.
+        if (pixelStride == 2 && rowStride == width * 2) {
+            FileOutputStream(file).channel.use { channel ->
+                val contiguous = source.duplicate()
+                contiguous.position(baseOffset)
+                contiguous.limit(baseOffset + width * height * 2)
+                while (contiguous.hasRemaining()) channel.write(contiguous)
+            }
+            fillProxyFromSource(
+                source = source,
+                baseOffset = baseOffset,
+                rowStride = rowStride,
+                pixelStride = pixelStride,
+                width = width,
+                height = height,
+                step = step,
+                proxyWidth = proxyWidth,
+                proxy = proxy,
+            )
+        } else {
+            val compactRow = ByteArray(width * 2)
+            BufferedOutputStream(FileOutputStream(file), 1024 * 1024).use { out ->
+                for (y in 0 until height) {
+                    val rowStart = baseOffset + y * rowStride
+                    var x = 0
+                    while (x < width) {
                         val sourceOffset = rowStart + x * pixelStride
                         compactRow[x * 2] = source.get(sourceOffset)
                         compactRow[x * 2 + 1] = source.get(sourceOffset + 1)
+                        x += 1
                     }
-                }
-                out.write(compactRow)
+                    out.write(compactRow)
 
-                if (y % step == 0) {
-                    val py = y / step
-                    var px = 0
-                    var x = 0
-                    while (x < width) {
-                        val lo = compactRow[x * 2].toInt() and 0xff
-                        val hi = compactRow[x * 2 + 1].toInt() and 0xff
-                        proxy[py * proxyWidth + px] = lo or (hi shl 8)
-                        px += 1
-                        x += step
+                    if (y % step == 0) {
+                        val py = y / step
+                        var px = 0
+                        x = 0
+                        while (x < width) {
+                            val lo = compactRow[x * 2].toInt() and 0xff
+                            val hi = compactRow[x * 2 + 1].toInt() and 0xff
+                            proxy[py * proxyWidth + px] = lo or (hi shl 8)
+                            px += 1
+                            x += step
+                        }
                     }
                 }
             }
@@ -86,12 +107,42 @@ object RawSpool {
         )
     }
 
+    private fun fillProxyFromSource(
+        source: java.nio.ByteBuffer,
+        baseOffset: Int,
+        rowStride: Int,
+        pixelStride: Int,
+        width: Int,
+        height: Int,
+        step: Int,
+        proxyWidth: Int,
+        proxy: IntArray,
+    ) {
+        var y = 0
+        while (y < height) {
+            val py = y / step
+            val rowStart = baseOffset + y * rowStride
+            var px = 0
+            var x = 0
+            while (x < width) {
+                val offset = rowStart + x * pixelStride
+                val lo = source.get(offset).toInt() and 0xff
+                val hi = source.get(offset + 1).toInt() and 0xff
+                proxy[py * proxyWidth + px] = lo or (hi shl 8)
+                px += 1
+                x += step
+            }
+            y += step
+        }
+    }
+
+    /** Finer even sampling materially reduces registration blur while keeping proxy memory bounded. */
     private fun chooseSampleStep(width: Int, height: Int): Int {
         val pixels = width.toLong() * height
         return when {
-            pixels > 40_000_000L -> 16
-            pixels > 18_000_000L -> 12
-            else -> 8
+            pixels > 48_000_000L -> 8
+            pixels > 24_000_000L -> 6
+            else -> 4
         }
     }
 

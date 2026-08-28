@@ -16,6 +16,7 @@ val signerSha = rootProject.file("tools/dev-signing/EXPECTED_CERT_SHA256")
 android {
     namespace = "com.sahidcode404.photonex2"
     compileSdk = 35
+    ndkVersion = "27.0.12077973"
 
     defaultConfig {
         applicationId = "com.sahidcode404.photonex2"
@@ -71,6 +72,13 @@ android {
     buildFeatures {
         compose = true
         buildConfig = true
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
     }
 
     packaging.resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"
