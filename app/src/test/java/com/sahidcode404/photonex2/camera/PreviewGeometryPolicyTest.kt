@@ -31,8 +31,9 @@ class PreviewGeometryPolicyTest {
             lensFacing = LensFacing.BACK,
         )
         assertEquals(90, geometry.clockwiseRotationDegrees)
-        assertEquals(1800f, geometry.renderedHeight, 0.01f)
-        assertTrue(geometry.renderedWidth >= 1080f)
+        assertEquals(1080f, geometry.renderedWidth, 0.01f)
+        assertEquals(1920f, geometry.renderedHeight, 0.01f)
+        assertTrue(geometry.renderedHeight >= 1800f)
     }
 
     @Test
