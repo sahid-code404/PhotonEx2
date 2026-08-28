@@ -93,3 +93,22 @@ class CameraHotStartStore(context: Context) {
         const val KEY_EQUIVALENT = "equivalent"
     }
 }
+
+/**
+ * Process-memory mirror of the verified hot-start route. It lets CameraDiscovery return a known-good
+ * route before walking camera IDs or stream maps. MainActivity installs it before the engine starts
+ * and refreshes it only after a real preview capture result proves that the route works.
+ */
+object CameraStartupCache {
+    @Volatile private var verifiedRoute: LensRoute? = null
+
+    fun install(route: LensRoute?) {
+        verifiedRoute = route
+    }
+
+    fun route(): LensRoute? = verifiedRoute
+
+    fun clear() {
+        verifiedRoute = null
+    }
+}
