@@ -1,11 +1,11 @@
 package com.sahidcode404.photonex2.camera
 
 import android.graphics.ImageFormat
+import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.os.Build
 import android.util.Size
-import android.view.SurfaceTexture
 import kotlin.math.abs
 
 /**
