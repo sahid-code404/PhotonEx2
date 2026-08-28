@@ -1,7 +1,6 @@
 package com.sahidcode404.photonex2.ui
 
 import android.view.TextureView
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -19,7 +18,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.weight
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
@@ -136,12 +134,11 @@ fun CameraScreen(
                 )
             }
 
-            AnimatedVisibility(
-                visible = state.capturing && state.progressText != null,
-                modifier = Modifier.align(Alignment.TopCenter),
-            ) {
+            if (state.capturing && state.progressText != null) {
                 Surface(
-                    modifier = Modifier.padding(top = 16.dp),
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .padding(top = 16.dp),
                     color = Color.Black.copy(alpha = 0.66f),
                     shape = RoundedCornerShape(100.dp),
                 ) {
@@ -159,7 +156,7 @@ fun CameraScreen(
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .padding(14.dp)
-                        .clickable(engine::clearError),
+                        .clickable(onClick = engine::clearError),
                     color = Color(0xCC351111),
                     shape = RoundedCornerShape(18.dp),
                 ) {
@@ -321,6 +318,8 @@ private fun ShutterBar(
     preferenceVersion: Long,
     onCapture: () -> Unit,
 ) {
+    @Suppress("UNUSED_VARIABLE")
+    val observedPreferenceVersion = preferenceVersion
     val manual = selected?.let { preferences.getManualFrameCount(it.key) }
     val mode = if (manual == null) "AUTO FRAMES" else "$manual FRAMES"
     Row(
@@ -411,6 +410,8 @@ private fun LensFrameSetting(
     preferences: LensPreferences,
     preferenceVersion: Long,
 ) {
+    @Suppress("UNUSED_VARIABLE")
+    val observedPreferenceVersion = preferenceVersion
     val current = preferences.getManualFrameCount(lens.key)
     Column(Modifier.fillMaxWidth().padding(vertical = 9.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
